@@ -1,6 +1,7 @@
 """Gateway runtime status helpers: PID/lock/marker files under ``{HERMES_HOME}`` (one set per
 home/profile) that tell whether the gateway daemon is running."""
 
+import ast
 import asyncio
 import contextlib
 import copy
@@ -528,6 +529,143 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
     return None
 
 
+def _list_literal_end(text: str, start: int) -> int:
+    """Index just past the bracket closing the opener at *start*, or -1: nested brackets and string
+    quotes are honoured so a path containing ``]`` cannot truncate the literal."""
+    depth = 0
+    quote: Optional[str] = None
+    index = start
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char in "[({":
+            depth += 1
+        elif char in "])}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return -1
+
+
+_INTERPRETER_BASENAME_RE = re.compile(r"python(?:w)?[0-9.]*t?(?:\.exe)?", re.IGNORECASE)
+_SHIM_ARGV_CANDIDATE_LIMIT = 4
+_SHIM_OPTION_SCAN_LIMIT = 32
+
+
+def _shim_payload_start(command: str) -> int:
+    """Index just past the ``-c`` of a python invocation, or -1.
+
+    Walked token by token rather than matched with one pattern: a command line is attacker-controlled
+    text, and a pattern that consumes interpreter options backtracks exponentially on a long run of
+    option-shaped words (measured in seconds for a 133-byte line).
+    """
+    tokens = [(match.end(), match.group()) for match in re.finditer(r"\S+", command)]
+    for position, (_, token) in enumerate(tokens):
+        basename = token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if not _INTERPRETER_BASENAME_RE.fullmatch(basename):
+            continue
+        index = position + 1
+        # Options before ``-c`` only: the first non-option word (``-m``'s module, a subcommand) means
+        # this is not a ``-c`` invocation at all, and the bound keeps a crafted line from rescanning.
+        while index < len(tokens) and index - position <= _SHIM_OPTION_SCAN_LIMIT:
+            option = tokens[index][1]
+            if option == "-c":
+                return tokens[index][0]
+            if not option.startswith("-"):
+                break
+            index += 2 if option in ("-W", "-X") and index + 1 < len(tokens) else 1
+    return -1
+
+
+def _quoted_argument_end(text: str) -> int:
+    """Index of the quote closing the argument that opens at ``text[0]``, or -1 when unterminated."""
+    quote = text[0]
+    index = 1
+    while index < len(text):
+        char = text[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == quote:
+            return index
+        index += 1
+    return -1
+
+
+def _shim_argv_tokens(command: str) -> list[str]:
+    """The argv a venv-shim relaunch packs into its ``-c`` payload (``sys.argv = [...]``), or ``[]``.
+
+    ``hermes_cli.venv_sync.relaunch_command`` re-enters the launcher on the managed interpreter as
+    ``python -I -c "import sys, runpy; sys.path.insert(0, <root>); sys.argv = [...]; runpy.run_module(...)"``.
+    A gateway started through that shim has no ``gateway`` token of its own on the process command
+    line: its real argv lives inside the payload, so reading it back is the only way the matcher can
+    tell a live shim-launched gateway from a foreign process.
+
+    Only an interpreter's own ``-c`` payload counts. The line must show a python invocation with
+    ``-c`` and the literal must appear after that ``-c``: a ``sys.argv`` assignment sitting in some
+    other argument of the line is that argument's text, not this process's argv. A wrapper in front of
+    the launcher (``sudo``, ``sh -c``, a supervisor) keeps that invocation on the line and matches,
+    where for the plain form the same wrapper only matched when its inner argv was visible.
+    """
+    if "-c" not in command or "sys.argv" not in command:
+        return []
+    payload_start = _shim_payload_start(command)
+    if payload_start == -1:
+        return []
+    payload = command[payload_start:].lstrip()
+    # A quoted payload is one argument: stop at its closing quote, so a later command's literal on the
+    # same line cannot be read as this process's argv. Argv read back from the process itself arrives
+    # space-joined with its quotes gone, so there the whole remainder is the payload. The window is cut
+    # before the escape repair below, which would otherwise turn every escaped inner quote into a
+    # window terminator.
+    if payload[:1] in ("\"", "'"):
+        quoted_end = _quoted_argument_end(payload)
+        if quoted_end != -1:
+            payload = payload[:quoted_end]
+    # cmd.exe quoting escapes every embedded double quote of an argv element; the payload is Python
+    # source, so undo that escape before reading the literal out of it.
+    if '\\"' in payload:
+        payload = payload.replace('\\"', '"')
+    # A command line is attacker-controlled text and every process scan pays for a scan that runs to
+    # the end of an unterminated literal, so the candidates are capped rather than searched forever.
+    for index, match in enumerate(re.finditer(r"\bsys\.argv\s*=\s*\[", payload)):
+        if index >= _SHIM_ARGV_CANDIDATE_LIMIT:
+            break
+        start = payload.index("[", match.start())
+        end = _list_literal_end(payload, start)
+        if end == -1:
+            continue
+        try:
+            argv = ast.literal_eval(payload[start:end])
+        except (SyntaxError, ValueError):
+            continue
+        if isinstance(argv, list) and argv and all(isinstance(part, str) for part in argv):
+            return argv
+    return []
+
+
+def _argv_texts(command: str) -> list[str]:
+    """``command`` and, for a launcher invocation, the argv its payload hides.
+
+    Profile and ``HERMES_HOME`` checks are argv checks. The shim renders ``--profile work`` on the
+    outer line as the fragments ``'--profile', work,``, which a token scan there cannot see -- so a
+    live shim-launched named-profile gateway reads as a foreign process for every profile-scoped
+    probe, while the default-profile branch (whose rule is "no other profile's flags") accepts it.
+    The outer line still answers, first: an ``env HERMES_HOME=<other home>`` prefix or a spelled-out
+    ``--profile`` belongs to whoever launched the process, and the payload must not erase it.
+    """
+    shim = _shim_argv_tokens(command)
+    return [command, " ".join(shim)] if shim else [command]
+
+
 def _gateway_command_subcommand(command: str | None) -> str | None:
     """Hermes gateway lifecycle subcommand from a command line, or None. No loose substring matches
     (``"gateway" in cmdline`` also matched ``gateway status`` / ``python -m tui_gateway``): needs a
@@ -544,17 +682,25 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     tokens = [t.strip("\"'").replace("\\", "/").lower() for t in raw_tokens]
     if not tokens:
         return None
-    basenames = [t.rsplit("/", 1)[-1] for t in tokens]
     # The launchd job's osascript wrapper (gateway_launchd.launchd_program_arguments) carries the gateway argv
     # inside one AppleScript string; the gateway itself is its child and is matched on its own command line.
-    if basenames[0] == "osascript":
+    if tokens[0].rsplit("/", 1)[-1] == "osascript":
         return None
+    # A shim relaunch hides its argv in the -c payload (see _shim_argv_tokens). Tokenized from the
+    # bootstrap source it is fragmented (`'gateway',` splits into `gateway` + `,`, so the subcommand
+    # scan reads `,`), which leaves the launcher form Hermes itself publishes unrecognized and makes
+    # the live gateway's own identity records look stale. The payload argv IS the process argv, so
+    # scan it directly and keep the tokenizer's fragments for the entrypoint checks only.
+    shim_tokens = [t.replace("\\", "/").lower() for t in _shim_argv_tokens(command)]
+    identity_tokens = tokens + shim_tokens
+    scan_tokens = shim_tokens or tokens
+    basenames = [t.rsplit("/", 1)[-1] for t in identity_tokens]
     # Gateway-dedicated entrypoints carry no subcommand to inspect.
-    if any(t == "gateway/run.py" or t.endswith("/gateway/run.py") for t in tokens):
+    if any(t == "gateway/run.py" or t.endswith("/gateway/run.py") for t in identity_tokens):
         return "run"
     if any(b in ("hermes-gateway", "hermes-gateway.exe") for b in basenames):
         return "run"
-    joined = " ".join(tokens)
+    joined = " ".join(identity_tokens)
     if "hermes_cli.main" not in joined and "hermes_cli/main.py" not in joined and not any(
         b in ("hermes", "hermes.exe") for b in basenames
     ):
@@ -562,7 +708,7 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     # Drop --profile X / -p X / --profile=X / -p=X (consumes a VALUE of "gateway" too).
     filtered: list[str] = []
     skip_next = False
-    for token in tokens:
+    for token in scan_tokens:
         if skip_next:
             skip_next = False
         elif token in ("--profile", "-p"):
@@ -609,13 +755,15 @@ def _profile_name_for_home(profile_home: Path) -> Optional[str]:
 
 def profile_flag_value(command: str) -> Optional[str]:
     """The ``-p``/``--profile`` argument of a command line, or None. Token equality is the only safe
-    profile match: a substring test lets ``-p ops`` claim (and ``gateway stop`` SIGTERM) ``-p ops-2``."""
-    tokens = command.split()
-    for i, tok in enumerate(tokens):
-        if tok.startswith("--profile="):
-            return tok.partition("=")[2]
-        if tok in ("-p", "--profile") and i + 1 < len(tokens):
-            return tokens[i + 1]
+    profile match: a substring test lets ``-p ops`` claim (and ``gateway stop`` SIGTERM) ``-p ops-2``.
+    Reads the outer line first, then the argv a shim ``-c`` payload hides (see :func:`_argv_texts`)."""
+    for text in _argv_texts(command):
+        tokens = text.split()
+        for i, tok in enumerate(tokens):
+            if tok.startswith("--profile="):
+                return tok.partition("=")[2]
+            if tok in ("-p", "--profile") and i + 1 < len(tokens):
+                return tokens[i + 1]
     return None
 
 
@@ -630,10 +778,13 @@ def hermes_home_assignments(command: str) -> list[str]:
     separator on the value is stripped -- ``HERMES_HOME=/root/.hermes/`` (systemd ``Environment=``
     or a shell wrapper spelling) is the same home as ``/root/.hermes``; callers strip the profile
     home the same way."""
-    return [
-        next(g for g in m.groups() if g is not None).rstrip("/")
-        for m in _HERMES_HOME_ASSIGNMENT_RE.finditer(command)
-    ]
+    values: list[str] = []
+    for text in _argv_texts(command):
+        values.extend(
+            next(g for g in m.groups() if g is not None).rstrip("/")
+            for m in _HERMES_HOME_ASSIGNMENT_RE.finditer(text)
+        )
+    return values
 
 
 def command_line_names_hermes_home(command_lc: str, home_lc: str) -> bool:
